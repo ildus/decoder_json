@@ -1,14 +1,17 @@
 /*-------------------------------------------------------------------------
  *
- * decoder_mf.c
- *      Logical decoding output plugin generating SQL queries based
+ * decoder_json.c
+ *      Logical decoding output plugin generating JSON structures based
  *      on things decoded.
  *
- * Copyright (c) 2013-2015, Michael Paquier
- * Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Author, Ildus Kurbangaliev
  *
  * IDENTIFICATION
- *        decoder_raw/decoder_raw.c
+ *        decoder_json/decoder_json.c
+ *
+ * TODO:
+ * 1) add detail logs for unsupported types and other cases (replica identity)
+ * 2) use postgresql internal realization of json
  *
  *-------------------------------------------------------------------------
  */
@@ -28,9 +31,7 @@
 #include "utils/relcache.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
-#include "utils/json.h"
 #include <jansson.h>
-
 
 PG_MODULE_MAGIC;
 
@@ -53,16 +54,16 @@ typedef struct
     json_t *value;
 } Pair;
 
-static void decoder_raw_startup(LogicalDecodingContext *ctx,
+static void decoder_json_startup(LogicalDecodingContext *ctx,
                                 OutputPluginOptions *opt,
                                 bool is_init);
-static void decoder_raw_shutdown(LogicalDecodingContext *ctx);
-static void decoder_raw_begin_txn(LogicalDecodingContext *ctx,
+static void decoder_json_shutdown(LogicalDecodingContext *ctx);
+static void decoder_json_begin_txn(LogicalDecodingContext *ctx,
                                   ReorderBufferTXN *txn);
-static void decoder_raw_commit_txn(LogicalDecodingContext *ctx,
+static void decoder_json_commit_txn(LogicalDecodingContext *ctx,
                                    ReorderBufferTXN *txn,
                                    XLogRecPtr commit_lsn);
-static void decoder_raw_change(LogicalDecodingContext *ctx,
+static void decoder_json_change(LogicalDecodingContext *ctx,
                                ReorderBufferTXN *txn, Relation rel,
                                ReorderBufferChange *change);
 
@@ -78,18 +79,19 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 {
     AssertVariableIsOfType(&_PG_output_plugin_init, LogicalOutputPluginInit);
 
-    cb->startup_cb = decoder_raw_startup;
-    cb->begin_cb = decoder_raw_begin_txn;
-    cb->change_cb = decoder_raw_change;
-    cb->commit_cb = decoder_raw_commit_txn;
-    cb->shutdown_cb = decoder_raw_shutdown;
+    cb->startup_cb = decoder_json_startup;
+    cb->begin_cb = decoder_json_begin_txn;
+    cb->change_cb = decoder_json_change;
+    cb->commit_cb = decoder_json_commit_txn;
+    cb->shutdown_cb = decoder_json_shutdown;
 }
 
 
 /* initialize this plugin */
 static void
-decoder_raw_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
-                  bool is_init)
+decoder_json_startup(LogicalDecodingContext *ctx,
+                     OutputPluginOptions *opt,
+                     bool is_init)
 {
     ListCell   *option;
     DecoderRawData *data;
@@ -124,28 +126,6 @@ decoder_raw_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
                          errmsg("could not parse value \"%s\" for parameter \"%s\"",
                                 strVal(elem->arg), elem->defname)));
         }
-        else if (strcmp(elem->defname, "output_format") == 0)
-        {
-            char       *format = NULL;
-
-            if (elem->arg == NULL)
-                ereport(ERROR,
-                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                         errmsg("No value specified for parameter \"%s\"",
-                                elem->defname)));
-
-            format = strVal(elem->arg);
-
-            if (strcmp(format, "textual") == 0)
-                opt->output_type = OUTPUT_PLUGIN_TEXTUAL_OUTPUT;
-            else if (strcmp(format, "binary") == 0)
-                opt->output_type = OUTPUT_PLUGIN_BINARY_OUTPUT;
-            else
-                ereport(ERROR,
-                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                         errmsg("Incorrect value \"%s\" for parameter \"%s\"",
-                                format, elem->defname)));
-        }
         else
         {
             ereport(ERROR,
@@ -159,7 +139,7 @@ decoder_raw_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 
 /* cleanup this plugin's resources */
 static void
-decoder_raw_shutdown(LogicalDecodingContext *ctx)
+decoder_json_shutdown(LogicalDecodingContext *ctx)
 {
     DecoderRawData *data = ctx->output_plugin_private;
 
@@ -169,7 +149,8 @@ decoder_raw_shutdown(LogicalDecodingContext *ctx)
 
 /* BEGIN callback */
 static void
-decoder_raw_begin_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
+decoder_json_begin_txn(LogicalDecodingContext *ctx,
+                       ReorderBufferTXN *txn)
 {
     DecoderRawData *data = ctx->output_plugin_private;
 
@@ -177,15 +158,16 @@ decoder_raw_begin_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
     if (data->include_transaction)
     {
         OutputPluginPrepareWrite(ctx, true);
-        appendStringInfoString(ctx->out, "BEGIN;");
+        appendStringInfoString(ctx->out, "begin");
         OutputPluginWrite(ctx, true);
     }
 }
 
 /* COMMIT callback */
 static void
-decoder_raw_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
-                     XLogRecPtr commit_lsn)
+decoder_json_commit_txn(LogicalDecodingContext *ctx,
+                        ReorderBufferTXN *txn,
+                        XLogRecPtr commit_lsn)
 {
     DecoderRawData *data = ctx->output_plugin_private;
 
@@ -193,7 +175,7 @@ decoder_raw_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
     if (data->include_transaction)
     {
         OutputPluginPrepareWrite(ctx, true);
-        appendStringInfoString(ctx->out, "COMMIT;");
+        appendStringInfoString(ctx->out, "commit");
         OutputPluginWrite(ctx, true);
     }
 }
@@ -201,7 +183,8 @@ decoder_raw_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 /*
  * Get a relation name.
  */
-static char* get_relname(Relation rel)
+static char
+*get_relname(Relation rel)
 {
     Form_pg_class   class_form = RelationGetForm(rel);
     return quote_qualified_identifier(
@@ -213,7 +196,10 @@ static char* get_relname(Relation rel)
 /*
  * Get json value for datum.
  */
-static json_t* get_json_value(Datum origval, Oid typid, bool isnull)
+static json_t
+*get_json_value(Datum origval,
+                Oid typid,
+                bool isnull)
 {
     Oid typoutput;
     bool typisvarlena;
@@ -222,8 +208,6 @@ static json_t* get_json_value(Datum origval, Oid typid, bool isnull)
     /* Query output function */
     getTypeOutputInfo(typid, &typoutput, &typisvarlena);
 
-    /* Print value */
-    val = NULL;
     if (isnull)
         return json_null();
     else if (typisvarlena && VARATT_IS_EXTERNAL_ONDISK(origval))
@@ -235,8 +219,6 @@ static json_t* get_json_value(Datum origval, Oid typid, bool isnull)
         /* Definitely detoasted Datum */
         val = PointerGetDatum(PG_DETOAST_DATUM(origval));
     }
-
-    Assert(val != NULL)
     switch (typid) {
         case BOOLOID:
             return json_boolean(DatumGetBool(val));
@@ -253,9 +235,9 @@ static json_t* get_json_value(Datum origval, Oid typid, bool isnull)
             return json_real(DatumGetFloat8(val));
         case TIMESTAMPOID:
         case TIMESTAMPTZOID:
-            return json_string(timestamptz_to_str(DatumGetTimestampTz(datum)));
+            return json_string(timestamptz_to_str(DatumGetTimestampTz(val)));
         case NUMERICOID:
-            /* we send numeric as string for value safety */
+            /* we send numeric as string for data safety */
         case CHAROID:
         case VARCHAROID:
         case BPCHAROID:
@@ -263,19 +245,27 @@ static json_t* get_json_value(Datum origval, Oid typid, bool isnull)
         case JSONOID:
         case XMLOID:
         case UUIDOID:
-            return json_string(OidOutputFunctionCall(typid, datum));
+            return json_string(OidOutputFunctionCall(typoutput, val));
+        default:
+            elog(ERROR, "Type %s is not supported", format_type_be(typid));
     }
+    return NULL;
 }
 
 /*
- * Print a WHERE clause item
+ * Get attr:value pair
  */
-static Pair* get_clause_item(StringInfo s, Relation relation, HeapTuple tuple, int natt)
+static Pair
+*get_pair(TupleDesc tupdesc,
+          HeapTuple tuple,
+          int natt)
 {
     Form_pg_attribute   attr;
     Datum               origval;
     bool                isnull;
-    TupleDesc           tupdesc = RelationGetDescr(relation);
+    Pair *pair;
+    char *attname;
+    json_t *val;
 
     attr = tupdesc->attrs[natt - 1];
 
@@ -283,33 +273,56 @@ static Pair* get_clause_item(StringInfo s, Relation relation, HeapTuple tuple, i
     if (attr->attisdropped || attr->attnum < 0)
         return NULL;
 
+    /* Get attribute name */
+    attname = NameStr(attr->attname);
+
     /* Get Datum from tuple */
     origval = fastgetattr(tuple, natt, tupdesc, &isnull);
-    json_t *val = get_json_value(origval, attr->atttypid, isnull);
+
+    val = get_json_value(origval, attr->atttypid, isnull);
+    elog(LOG, "We got json val for: %s=%s", attname, json_dumps(val, JSON_ENCODE_ANY));
     if (val == NULL)
         return NULL;
 
-    Pair *pair = palloc(sizeof(Pair));
+    pair = malloc(sizeof(Pair));
     pair->value = val;
-    pair->name = NameStr(attr->attname);
+    pair->name = attname;
     return pair;
+}
+
+static json_t
+*get_pairs(TupleDesc tupdesc,
+           HeapTuple tuple)
+{
+    int natt;
+    json_t *pairs = json_object();
+
+    for (natt = 0; natt < tupdesc->natts; natt++) {
+        Pair *pair = get_pair(tupdesc, tuple, natt + 1);
+        if (pair == NULL)
+            continue;
+
+        json_object_set_new(pairs, pair->name, pair->value);
+        free(pair);
+    }
+    return pairs;
 }
 
 /*
  * Generate a WHERE clause for UPDATE or DELETE.
  */
-static void get_where_clause(Relation relation, HeapTuple oldtuple, HeapTuple newtuple)
+static json_t
+*get_where_clause(Relation relation,
+                  HeapTuple oldtuple,
+                  HeapTuple newtuple)
 {
-    TupleDesc       tupdesc = RelationGetDescr(relation);
-    int             natt;
-    bool            first_column = true;
+    TupleDesc tupdesc = RelationGetDescr(relation);
+    int natt;
+    json_t *allClauses = json_object();
 
     Assert(relation->rd_rel->relreplident == REPLICA_IDENTITY_DEFAULT ||
            relation->rd_rel->relreplident == REPLICA_IDENTITY_FULL ||
            relation->rd_rel->relreplident == REPLICA_IDENTITY_INDEX);
-
-    /* Build the WHERE clause */
-    appendStringInfoString(s, " WHERE ");
 
     RelationGetIndexList(relation);
     /* Generate WHERE clause using new values of REPLICA IDENTITY */
@@ -331,12 +344,14 @@ static void get_where_clause(Relation relation, HeapTuple oldtuple, HeapTuple ne
              * be used for tuple selectivity. If no such columns are
              * updated, old tuple data is NULL.
              */
-            print_where_clause_item(s, relation,
-                                    oldtuple ? oldtuple : newtuple,
-                                    relattr, &first_column);
+            Pair *pair = get_pair(tupdesc, oldtuple ? oldtuple : newtuple, relattr);
+            if (pair == NULL)
+                continue;
+            json_object_set_new(allClauses, pair->name, pair->value);
+            free(pair);
         }
         index_close(indexRel, NoLock);
-        return;
+        return allClauses;
     }
 
     /* We need absolutely some values for tuple selectivity now */
@@ -347,69 +362,57 @@ static void get_where_clause(Relation relation, HeapTuple oldtuple, HeapTuple ne
      * Fallback to default case, use of old values and print WHERE clause
      * using all the columns. This is actually the code path for FULL.
      */
-    for (natt = 0; natt < tupdesc->natts; natt++)
-        print_where_clause_item(s, relation, oldtuple,
-                                natt + 1, &first_column);
+    for (natt = 0; natt < tupdesc->natts; natt++) {
+        Pair *pair = get_pair(tupdesc, oldtuple, natt + 1);
+        if (pair == NULL)
+            continue;
+
+        json_object_set_new(allClauses, pair->name, pair->value);
+        free(pair);
+    }
+    return allClauses;
+}
+
+static void
+write_struct(StringInfo s,
+             int actionId,
+             Relation relation,
+             json_t *clause,
+             json_t *data)
+{
+    char *relname = get_relname(relation);
+    char *result;
+
+    /* Generate struct */
+    json_t *action = json_object();
+    json_object_set_new(action, "a", json_integer(actionId));
+    json_object_set_new(action, "r", json_string(relname));
+    if (clause != NULL)
+        json_object_set(action, "c", clause);
+    if (data != NULL)
+        json_object_set(action, "d", data);
+
+    result = json_dumps(action, JSON_COMPACT);
+    json_decref(action);
+
+    elog(LOG, "Struct:%s", result);
+
+    appendStringInfoString(s, result);
+    free(result);
 }
 
 /*
  * Decode an INSERT entry
  */
 static void
-decoder_raw_insert(StringInfo s,
+decoder_json_insert(StringInfo s,
                    Relation relation,
                    HeapTuple tuple)
 {
-    TupleDesc       tupdesc = RelationGetDescr(relation);
-    int             natt;
-    bool            first_column = true;
-    StringInfo      values = makeStringInfo();
-
-    /* Initialize string info for values */
-    initStringInfo(values);
-
-    /* Query header */
-    appendStringInfo(s, "INSERT INTO ");
-    print_relname(s, relation);
-    appendStringInfo(s, " (");
-
-    /* Build column names and values */
-    for (natt = 0; natt < tupdesc->natts; natt++)
-    {
-        Form_pg_attribute   attr;
-        Datum               origval;
-        bool                isnull;
-
-        attr = tupdesc->attrs[natt];
-
-        /* Skip dropped columns and system columns */
-        if (attr->attisdropped || attr->attnum < 0)
-            continue;
-
-        /* Skip comma for first colums */
-        if (!first_column)
-        {
-            appendStringInfoString(s, ", ");
-            appendStringInfoString(values, ", ");
-        }
-        else
-            first_column = false;
-
-        /* Print attribute name */
-        appendStringInfo(s, "%s", quote_identifier(NameStr(attr->attname)));
-
-        /* Get Datum from tuple */
-        origval = fastgetattr(tuple, natt + 1, tupdesc, &isnull);
-
-        /* Get output function */
-        print_value(values, origval, attr->atttypid, isnull);
-    }
-
-    /* Append values  */
-    appendStringInfo(s, ") VALUES (%s);", values->data);
-
-    /* Clean up */
-    resetStringInfo(values);
+    TupleDesc tupdesc = RelationGetDescr(relation);
+    json_t *data = get_pairs(tupdesc, tuple);
+    write_struct(s, 0, relation, NULL, data);
+    json_decref(data);
 }
 
 /*
@@ -417,28 +420,19 @@ decoder_raw_insert(StringInfo s,
  * Append to output json structure like
  * {"a": 2, "r": "public.table_name", "c": "some_clause"}
  */
-static void decoder_json_delete(StringInfo s, Relation relation, HeapTuple tuple)
+static void
+decoder_json_delete(StringInfo s,
+                    Relation relation,
+                    HeapTuple tuple)
 {
-    char *relname = get_relname(relation);
     /*
      * Here the same tuple is used as old and new values, selectivity will
      * be properly reduced by relation uses DEFAULT or INDEX as REPLICA
      * IDENTITY.
      */
-    char *clause = get_where_clause(relation, tuple, tuple);
-
-    /* Generate struct */
-    json_t *action;
-    action = json_object();
-    json_object_set_new(action, "a", json_integer(2));
-    json_object_set_new(action, "r", json_string(relname));
-    json_object_set_new(action, "c", json_string(clause));
-
-    char *result = json_dumps(action, JSON_COMPACT);
-    json_free_t(action);
-
-    appendStringInfo(s, result);
-    free(result);
+    json_t *clause = get_where_clause(relation, tuple, tuple);
+    write_struct(s, 2, relation, clause, NULL);
+    json_decref(clause);
 }
 
 
@@ -446,64 +440,34 @@ static void decoder_json_delete(StringInfo s, Relation relation, HeapTuple tuple
  * Decode an UPDATE entry
  */
 static void
-decoder_raw_update(StringInfo s,
+decoder_json_update(StringInfo s,
                    Relation relation,
                    HeapTuple oldtuple,
                    HeapTuple newtuple)
 {
-    TupleDesc       tupdesc = RelationGetDescr(relation);
-    int             natt;
-    bool            first_column = true;
+    json_t *clause;
+    json_t *data;
+    TupleDesc tupdesc = RelationGetDescr(relation);
 
     /* If there are no new values, simply leave as there is nothing to do */
     if (newtuple == NULL)
         return;
 
-    appendStringInfo(s, "UPDATE ");
-    print_relname(s, relation);
-
-    /* Build the SET clause with the new values */
-    appendStringInfo(s, " SET ");
-
-    json_t * values;
-    values = json_object();
-    for (natt = 0; natt < tupdesc->natts; natt++)
-    {
-        Form_pg_attribute   attr;
-        Datum               origval;
-        bool                isnull;
-
-        attr = tupdesc->attrs[natt];
-
-        /* Skip dropped columns and system columns */
-        if (attr->attisdropped || attr->attnum < 0)
-            continue;
-
-        /* Get Datum from tuple */
-        origval = fastgetattr(newtuple, natt + 1, tupdesc, &isnull);
-
-        json_object_set_new(values, NameStr(attr->attname), json_integer(10));
-        appendStringInfoString(s, json_dumps(values, 1));
-
-
-
-
-        /* Get output function */
-        //print_value(s, origval, attr->atttypid, isnull);
-    }
-
-    /* Print WHERE clause */
-    print_where_clause(s, relation, oldtuple, newtuple);
-
-    appendStringInfoString(s, ";");
+    clause = get_where_clause(relation, oldtuple, newtuple);
+    data = get_pairs(tupdesc, newtuple);
+    write_struct(s, 1, relation, clause, data);
+    json_decref(clause);
+    json_decref(data);
 }
 
 /*
  * Callback for individual changed tuples
  */
 static void
-decoder_raw_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
-                 Relation relation, ReorderBufferChange *change)
+decoder_json_change(LogicalDecodingContext *ctx,
+                    ReorderBufferTXN *txn,
+                    Relation relation,
+                    ReorderBufferChange *change)
 {
     DecoderRawData *data;
     MemoryContext   old;
@@ -526,6 +490,8 @@ decoder_raw_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
                             (replident == REPLICA_IDENTITY_DEFAULT &&
                              !OidIsValid(relation->rd_replidindex)));
 
+    elog(LOG, "Entering change callback");
+
     /* Decode entry depending on its type */
     switch (change->action)
     {
@@ -533,7 +499,7 @@ decoder_raw_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
             if (change->data.tp.newtuple != NULL)
             {
                 OutputPluginPrepareWrite(ctx, true);
-                decoder_raw_insert(ctx->out,
+                decoder_json_insert(ctx->out,
                                    relation,
                                    &change->data.tp.newtuple->tuple);
                 OutputPluginWrite(ctx, true);
@@ -548,7 +514,7 @@ decoder_raw_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
                     &change->data.tp.newtuple->tuple : NULL;
 
                 OutputPluginPrepareWrite(ctx, true);
-                decoder_raw_update(ctx->out,
+                decoder_json_update(ctx->out,
                                    relation,
                                    oldtuple,
                                    newtuple);

@@ -1,0 +1,9 @@
+--
+-- Basic tests
+--
+-- Create a replication slot
+SELECT slot_name FROM pg_create_logical_replication_slot('custom_slot', 'decoder_raw');
+  slot_name
+-------------
+ custom_slot
+(1 row)
