@@ -10,3 +10,10 @@
 *.so
 *.so.*
 *.dylib
+
+/jansson-*
+
+# Regression output
+/regression.diffs
+/regression.out
+/results/
