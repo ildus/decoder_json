@@ -5,7 +5,7 @@ OBJS = decoder_json.o
 JANSSON_VERSION = 2.7
 SHLIB_LINK = ./jansson-${JANSSON_VERSION}/build/lib/libjansson.a
 PG_CPPFLAGS =  -I./jansson-${JANSSON_VERSION}/build/include
-REGRESS = basic second
+REGRESS = default
 
 include $(PGXS)
 
@@ -19,8 +19,6 @@ deps:
 
 test:
 	- psql contrib_regression -c "SELECT pg_drop_replication_slot('custom_slot');"
-	- make clean
-	make
 	rm `pg_config --pkglibdir`/decoder_json.so
 	cp decoder_json.so `pg_config --pkglibdir`/
 	make installcheck

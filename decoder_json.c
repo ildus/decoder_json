@@ -31,6 +31,7 @@
 #include "utils/relcache.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
+#include "utils/array.h"
 #include <jansson.h>
 
 PG_MODULE_MAGIC;
@@ -45,7 +46,8 @@ extern void     _PG_output_plugin_init(OutputPluginCallbacks *cb);
 typedef struct
 {
     MemoryContext context;
-    bool        include_transaction;
+    bool include_transaction;
+    bool sort_keys;
 } DecoderRawData;
 
 typedef struct
@@ -103,6 +105,7 @@ decoder_json_startup(LogicalDecodingContext *ctx,
                                           ALLOCSET_DEFAULT_INITSIZE,
                                           ALLOCSET_DEFAULT_MAXSIZE);
     data->include_transaction = false;
+    data->sort_keys = false;
 
     ctx->output_plugin_private = data;
 
@@ -121,6 +124,16 @@ decoder_json_startup(LogicalDecodingContext *ctx,
             if (elem->arg == NULL)
                 data->include_transaction = true;
             else if (!parse_bool(strVal(elem->arg), &data->include_transaction))
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("could not parse value \"%s\" for parameter \"%s\"",
+                                strVal(elem->arg), elem->defname)));
+        }
+        else if (strcmp(elem->defname, "sort_keys") == 0) {
+            /* if option does not provide a value, it means its value is true */
+            if (elem->arg == NULL)
+                data->sort_keys = true;
+            else if (!parse_bool(strVal(elem->arg), &data->sort_keys))
                 ereport(ERROR,
                         (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                          errmsg("could not parse value \"%s\" for parameter \"%s\"",
@@ -193,6 +206,29 @@ static char
             NameStr(class_form->relname));
 }
 
+static json_t *get_json_value(Datum, Oid, bool);
+
+static json_t
+*get_json_array(Datum array, Oid elmtype, int elmlen, bool elmbyval) {
+    Datum *elems;
+    int nelems, i;
+    ArrayType  *arr = DatumGetArrayTypeP(array);
+    json_t *result = json_array();
+
+    if (ARR_NDIM(arr) != 1 || ARR_HASNULL(arr) || ARR_ELEMTYPE(arr) != elmtype) {
+        elog(ERROR, "expected 1-D array");
+        return NULL;
+    }
+
+    deconstruct_array(arr, elmtype, elmlen, elmbyval, 'i', &elems, NULL, &nelems);
+    for (i = 0; i < nelems; ++i) {
+        json_array_append_new(result, get_json_value(elems[i], elmtype, false));
+    }
+
+    pfree(elems);
+    return result;
+}
+
 /*
  * Get json value for datum.
  */
@@ -246,8 +282,21 @@ static json_t
         case XMLOID:
         case UUIDOID:
             return json_string(OidOutputFunctionCall(typoutput, val));
+        case 1015:
+            /* varchar array */
+            return get_json_array(val, VARCHAROID, -1, false);
+        case TEXTARRAYOID:
+            return get_json_array(val, TEXTOID, -1, false);
+        case INT2ARRAYOID:
+            return get_json_array(val, INT2OID, 2, true);
+        case INT4ARRAYOID:
+            return get_json_array(val, INT4OID, 4, true);
+        case FLOAT4ARRAYOID:
+            return get_json_array(val, FLOAT4OID, 4, true);
+        case OIDARRAYOID:
+            return get_json_array(val, OIDOID, 8, true);
         default:
-            elog(ERROR, "Type %s is not supported", format_type_be(typid));
+            elog(ERROR, "Type %s is not supported, oid=%d", format_type_be(typid), typid);
     }
     return NULL;
 }
@@ -284,7 +333,7 @@ static Pair
     if (val == NULL)
         return NULL;
 
-    pair = malloc(sizeof(Pair));
+    pair = palloc(sizeof(Pair));
     pair->value = val;
     pair->name = attname;
     return pair;
@@ -303,7 +352,7 @@ static json_t
             continue;
 
         json_object_set_new(pairs, pair->name, pair->value);
-        free(pair);
+        pfree(pair);
     }
     return pairs;
 }
@@ -348,7 +397,7 @@ static json_t
             if (pair == NULL)
                 continue;
             json_object_set_new(allClauses, pair->name, pair->value);
-            free(pair);
+            pfree(pair);
         }
         index_close(indexRel, NoLock);
         return allClauses;
@@ -368,7 +417,7 @@ static json_t
             continue;
 
         json_object_set_new(allClauses, pair->name, pair->value);
-        free(pair);
+        pfree(pair);
     }
     return allClauses;
 }
@@ -378,13 +427,17 @@ write_struct(StringInfo s,
              int actionId,
              Relation relation,
              json_t *clause,
-             json_t *data)
+             json_t *data,
+             bool sort_keys)
 {
     char *relname = get_relname(relation);
     char *result;
-
-    /* Generate struct */
+    size_t flags = JSON_COMPACT;
     json_t *action = json_object();
+
+    if (sort_keys) flags |= JSON_SORT_KEYS;
+
+    /* Generate struct */    
     json_object_set_new(action, "a", json_integer(actionId));
     json_object_set_new(action, "r", json_string(relname));
     if (clause != NULL)
@@ -392,7 +445,7 @@ write_struct(StringInfo s,
     if (data != NULL)
         json_object_set(action, "d", data);
 
-    result = json_dumps(action, JSON_COMPACT);
+    result = json_dumps(action, flags);
     json_decref(action);
 
     elog(LOG, "Struct:%s", result);
@@ -407,11 +460,12 @@ write_struct(StringInfo s,
 static void
 decoder_json_insert(StringInfo s,
                    Relation relation,
-                   HeapTuple tuple)
+                   HeapTuple tuple,
+                   bool sort_keys)
 {
     TupleDesc tupdesc = RelationGetDescr(relation);
     json_t *data = get_pairs(tupdesc, tuple);
-    write_struct(s, 0, relation, NULL, data);
+    write_struct(s, 0, relation, NULL, data, sort_keys);
     json_decref(data);
 }
 
@@ -423,7 +477,8 @@ decoder_json_insert(StringInfo s,
 static void
 decoder_json_delete(StringInfo s,
                     Relation relation,
-                    HeapTuple tuple)
+                    HeapTuple tuple,
+                    bool sort_keys)
 {
     /*
      * Here the same tuple is used as old and new values, selectivity will
@@ -431,7 +486,7 @@ decoder_json_delete(StringInfo s,
      * IDENTITY.
      */
     json_t *clause = get_where_clause(relation, tuple, tuple);
-    write_struct(s, 2, relation, clause, NULL);
+    write_struct(s, 2, relation, clause, NULL, sort_keys);
     json_decref(clause);
 }
 
@@ -443,7 +498,8 @@ static void
 decoder_json_update(StringInfo s,
                    Relation relation,
                    HeapTuple oldtuple,
-                   HeapTuple newtuple)
+                   HeapTuple newtuple,
+                   bool sort_keys)
 {
     json_t *clause;
     json_t *data;
@@ -455,7 +511,7 @@ decoder_json_update(StringInfo s,
 
     clause = get_where_clause(relation, oldtuple, newtuple);
     data = get_pairs(tupdesc, newtuple);
-    write_struct(s, 1, relation, clause, data);
+    write_struct(s, 1, relation, clause, data, sort_keys);
     json_decref(clause);
     json_decref(data);
 }
@@ -490,8 +546,6 @@ decoder_json_change(LogicalDecodingContext *ctx,
                             (replident == REPLICA_IDENTITY_DEFAULT &&
                              !OidIsValid(relation->rd_replidindex)));
 
-    elog(LOG, "Entering change callback");
-
     /* Decode entry depending on its type */
     switch (change->action)
     {
@@ -501,7 +555,8 @@ decoder_json_change(LogicalDecodingContext *ctx,
                 OutputPluginPrepareWrite(ctx, true);
                 decoder_json_insert(ctx->out,
                                    relation,
-                                   &change->data.tp.newtuple->tuple);
+                                   &change->data.tp.newtuple->tuple,
+                                   data->sort_keys);
                 OutputPluginWrite(ctx, true);
             }
             break;
@@ -517,7 +572,8 @@ decoder_json_change(LogicalDecodingContext *ctx,
                 decoder_json_update(ctx->out,
                                    relation,
                                    oldtuple,
-                                   newtuple);
+                                   newtuple,
+                                   data->sort_keys);
                 OutputPluginWrite(ctx, true);
             }
             break;
@@ -527,7 +583,8 @@ decoder_json_change(LogicalDecodingContext *ctx,
                 OutputPluginPrepareWrite(ctx, true);
                 decoder_json_delete(ctx->out,
                                    relation,
-                                   &change->data.tp.oldtuple->tuple);
+                                   &change->data.tp.oldtuple->tuple,
+                                   data->sort_keys);
                 OutputPluginWrite(ctx, true);
             }
             break;

@@ -1,0 +1,29 @@
+SELECT slot_name FROM pg_create_logical_replication_slot('custom_slot', 'decoder_json');
+  slot_name  
+-------------
+ custom_slot
+(1 row)
+
+-- DEFAULT case with PRIMARY KEY
+CREATE TABLE aa (a int primary key, b text NOT NULL);
+INSERT INTO aa VALUES (1, 'aa'), (2, 'bb');
+UPDATE aa SET b = 'aa1' where a = 1; -- Primary key not changed
+UPDATE aa SET a=3, b = 'aa2' where a = 1; -- Primary key changed
+UPDATE aa SET b='cc' WHERE a != 0;
+SELECT data FROM pg_logical_slot_get_changes('custom_slot', NULL, NULL, 'include_transaction', 'off', 'sort_keys', 'on');
+                           data                            
+-----------------------------------------------------------
+ {"a":0,"d":{"a":1,"b":"aa"},"r":"public.aa"}
+ {"a":0,"d":{"a":2,"b":"bb"},"r":"public.aa"}
+ {"a":1,"c":{"a":1},"d":{"a":1,"b":"aa1"},"r":"public.aa"}
+ {"a":1,"c":{"a":1},"d":{"a":3,"b":"aa2"},"r":"public.aa"}
+ {"a":1,"c":{"a":2},"d":{"a":2,"b":"cc"},"r":"public.aa"}
+ {"a":1,"c":{"a":3},"d":{"a":3,"b":"cc"},"r":"public.aa"}
+(6 rows)
+
+SELECT pg_drop_replication_slot('custom_slot');
+ pg_drop_replication_slot 
+--------------------------
+ 
+(1 row)
+
