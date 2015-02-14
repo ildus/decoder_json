@@ -17,3 +17,10 @@
 /regression.diffs
 /regression.out
 /results/
+
+#qt creator files
+decoder_json.creator
+decoder_json.creator.user
+decoder_json.files
+decoder_json.includes
+decoder_json.config

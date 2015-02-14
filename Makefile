@@ -19,6 +19,6 @@ deps:
 
 test:
 	- psql contrib_regression -c "SELECT pg_drop_replication_slot('custom_slot');"
-	rm `pg_config --pkglibdir`/decoder_json.so
+	- rm `pg_config --pkglibdir`/decoder_json.so
 	cp decoder_json.so `pg_config --pkglibdir`/
 	make installcheck

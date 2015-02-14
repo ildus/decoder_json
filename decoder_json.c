@@ -329,7 +329,7 @@ static Pair
     origval = fastgetattr(tuple, natt, tupdesc, &isnull);
 
     val = get_json_value(origval, attr->atttypid, isnull);
-    elog(LOG, "We got json val for: %s=%s", attname, json_dumps(val, JSON_ENCODE_ANY));
+    //elog(LOG, "We got json val for: %s=%s", attname, json_dumps(val, JSON_ENCODE_ANY));
     if (val == NULL)
         return NULL;
 
