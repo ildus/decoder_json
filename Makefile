@@ -3,7 +3,7 @@ PGXS := $(shell $(PG_CONFIG) --pgxs)
 MODULE_big = decoder_json
 OBJS = decoder_json.o
 JANSSON_VERSION = 2.7
-SHLIB_LINK = ./jansson-${JANSSON_VERSION}/build/lib/libjansson.a
+SHLIB_LINK = -Wl,--version-script,visibility.map ./jansson-${JANSSON_VERSION}/build/lib/libjansson.a
 PG_CPPFLAGS =  -I./jansson-${JANSSON_VERSION}/build/include
 REGRESS = default
 

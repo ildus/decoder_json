@@ -32,6 +32,7 @@
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 #include "utils/array.h"
+#include <assert.h>
 #include <jansson.h>
 
 PG_MODULE_MAGIC;
@@ -98,7 +99,9 @@ decoder_json_startup(LogicalDecodingContext *ctx,
     ListCell   *option;
     DecoderRawData *data;
 
+    json_set_alloc_funcs(palloc,pfree);
     data = palloc(sizeof(DecoderRawData));
+    assert(data);
     data->context = AllocSetContextCreate(ctx->context,
                                           "Raw decoder context",
                                           ALLOCSET_DEFAULT_MINSIZE,
@@ -334,6 +337,7 @@ static Pair
         return NULL;
 
     pair = palloc(sizeof(Pair));
+    assert(pair);
     pair->value = val;
     pair->name = attname;
     return pair;
@@ -451,7 +455,7 @@ write_struct(StringInfo s,
     elog(LOG, "Struct:%s", result);
 
     appendStringInfoString(s, result);
-    free(result);
+    pfree(result);
 }
 
 /*

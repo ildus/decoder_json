@@ -1,0 +1,5 @@
+PG
+{
+	global: Pg_magic_func; _PG_output_plugin_init;
+	local: *;
+};
